@@ -324,9 +324,28 @@ fn main() {
         config.define("ANDROID_ABI", abi);
         config.define("ANDROID_PLATFORM", "android-26");
 
-        // Vulkan shader compilation: CMake's find_package(Vulkan) won't find glslc
-        // during cross-compilation. The NDK bundles it in shader-tools/<host-tag>/.
+        // Vulkan on Android: the NDK only ships C headers (vulkan.h), but ggml-vulkan
+        // requires the C++ headers (vulkan.hpp) from Khronos' Vulkan-Headers repo.
+        // Also, CMake's find_package(Vulkan) won't find glslc during cross-compilation.
         if cfg!(feature = "vulkan") && !ndk.is_empty() {
+            // 1. Fetch Vulkan C++ headers if missing from NDK sysroot
+            let out_dir = env::var("OUT_DIR").unwrap();
+            let vk_hpp_dir = format!("{}/vulkan-headers", out_dir);
+            let vk_hpp_include = format!("{}/include", vk_hpp_dir);
+            if !std::path::Path::new(&format!("{}/vulkan/vulkan.hpp", vk_hpp_include)).exists() {
+                let status = std::process::Command::new("git")
+                    .args(["clone", "--depth", "1",
+                           "https://github.com/KhronosGroup/Vulkan-Headers.git",
+                           &vk_hpp_dir])
+                    .status()
+                    .expect("Failed to run git clone for Vulkan-Headers");
+                if !status.success() {
+                    panic!("Failed to clone Vulkan-Headers (needed for vulkan.hpp on Android)");
+                }
+            }
+            config.define("Vulkan_INCLUDE_DIR", &vk_hpp_include);
+
+            // 2. Point CMake to NDK's bundled glslc for shader compilation
             let host_tag = if cfg!(target_os = "macos") {
                 "darwin-x86_64"
             } else if cfg!(windows) {
