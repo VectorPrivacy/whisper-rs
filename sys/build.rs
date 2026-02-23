@@ -215,7 +215,10 @@ fn main() {
 
     if cfg!(feature = "vulkan") {
         config.define("GGML_VULKAN", "ON");
-        if cfg!(windows) {
+        if target.contains("android") {
+            // Android: libvulkan.so is a system library, NDK sysroot provides the linking stub
+            println!("cargo:rustc-link-lib=vulkan");
+        } else if cfg!(windows) {
             println!("cargo:rerun-if-env-changed=VULKAN_SDK");
             println!("cargo:rustc-link-lib=vulkan-1");
             let vulkan_path = match env::var("VULKAN_SDK") {
@@ -320,6 +323,22 @@ fn main() {
         };
         config.define("ANDROID_ABI", abi);
         config.define("ANDROID_PLATFORM", "android-26");
+
+        // Vulkan shader compilation: CMake's find_package(Vulkan) won't find glslc
+        // during cross-compilation. The NDK bundles it in shader-tools/<host-tag>/.
+        if cfg!(feature = "vulkan") && !ndk.is_empty() {
+            let host_tag = if cfg!(target_os = "macos") {
+                "darwin-x86_64"
+            } else if cfg!(windows) {
+                "windows-x86_64"
+            } else {
+                "linux-x86_64"
+            };
+            let glslc = format!("{}/shader-tools/{}/glslc", ndk, host_tag);
+            if std::path::Path::new(&glslc).exists() {
+                config.define("Vulkan_GLSLC_EXECUTABLE", &glslc);
+            }
+        }
     }
 
     // Allow passing any WHISPER or CMAKE compile flags
