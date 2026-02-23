@@ -28,6 +28,21 @@ fn main() {
             println!("cargo:rustc-link-lib=framework=Metal");
             println!("cargo:rustc-link-lib=framework=MetalKit");
         }
+
+        // whisper.cpp's Metal backend uses @available() checks which compile to
+        // ___isPlatformVersionAtLeast calls. Link the Clang compiler runtime to
+        // provide this symbol. Use `xcrun clang` to find the system compiler's
+        // resource dir (plain `clang` may resolve to an Android NDK toolchain).
+        if let Ok(output) = std::process::Command::new("xcrun")
+            .args(["clang", "--print-resource-dir"])
+            .output()
+        {
+            if let Ok(resource_dir) = String::from_utf8(output.stdout) {
+                let rt_path = format!("{}/lib/darwin", resource_dir.trim());
+                println!("cargo:rustc-link-search=native={}", rt_path);
+                println!("cargo:rustc-link-lib=static=clang_rt.osx");
+            }
+        }
     }
 
     #[cfg(feature = "coreml")]
@@ -246,6 +261,24 @@ fn main() {
         config.define("GGML_METAL", "OFF");
     }
 
+    // Disable BLAS/Accelerate for non-Apple targets (ggml CMakeLists.txt defaults
+    // BLAS=ON with Apple vendor when the host is macOS, even during cross-compilation)
+    if !target.contains("apple") && !cfg!(feature = "openblas") {
+        config.define("GGML_BLAS", "OFF");
+        config.define("GGML_ACCELERATE", "OFF");
+    }
+
+    // whisper.cpp uses std::filesystem (macOS 10.15+). Ensure the cmake deployment
+    // target is at least 10.15 even if the embedding app targets older (e.g. Tauri 10.13).
+    if target.contains("apple") {
+        let current = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_default();
+        let min_major: u32 = current.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let min_minor: u32 = current.split('.').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        if min_major < 10 || (min_major == 10 && min_minor < 15) {
+            config.define("CMAKE_OSX_DEPLOYMENT_TARGET", "10.15");
+        }
+    }
+
     if cfg!(debug_assertions) || cfg!(feature = "force-debug") {
         // debug builds are too slow to even remotely be usable,
         // so we build with optimizations even in debug mode
@@ -255,6 +288,38 @@ fn main() {
         // we're in release mode, explicitly set to release mode
         // see also https://codeberg.org/tazz4843/whisper-rs/issues/226
         config.define("CMAKE_BUILD_TYPE", "Release");
+    }
+
+    // Android NDK cross-compilation: cmake 4.x requires the NDK toolchain file
+    // (CMAKE_SYSTEM_NAME=Android alone no longer works — cmake injects macOS flags).
+    // Map the Rust target triple to the correct ANDROID_ABI so the NDK toolchain
+    // compiles for the right architecture.
+    if target.contains("android") {
+        let ndk = env::var("ANDROID_NDK_HOME")
+            .or_else(|_| env::var("ANDROID_NDK"))
+            .or_else(|_| env::var("NDK_HOME"))
+            .unwrap_or_default();
+
+        if !ndk.is_empty() {
+            let toolchain = format!("{}/build/cmake/android.toolchain.cmake", ndk);
+            if std::path::Path::new(&toolchain).exists() {
+                config.define("CMAKE_TOOLCHAIN_FILE", &toolchain);
+            }
+        }
+
+        let abi = if target.contains("aarch64") {
+            "arm64-v8a"
+        } else if target.contains("armv7") {
+            "armeabi-v7a"
+        } else if target.contains("x86_64") {
+            "x86_64"
+        } else if target.contains("i686") {
+            "x86"
+        } else {
+            "arm64-v8a"
+        };
+        config.define("ANDROID_ABI", abi);
+        config.define("ANDROID_PLATFORM", "android-26");
     }
 
     // Allow passing any WHISPER or CMAKE compile flags
@@ -295,7 +360,7 @@ fn main() {
         println!("cargo:rustc-link-lib=static=ggml-base");
         println!("cargo:rustc-link-lib=static=ggml-cpu");
     }
-    if cfg!(target_os = "macos") || cfg!(feature = "openblas") {
+    if target.contains("apple") || cfg!(feature = "openblas") {
         println!("cargo:rustc-link-lib=static=ggml-blas");
     }
     if cfg!(feature = "vulkan") {
