@@ -119,6 +119,16 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let whisper_root = out.join("whisper.cpp");
 
+    // WHISPER_PATCHES: a directory of `git diff` patches for the copied sources, applied in name
+    // order, so the embedding app carries its whisper.cpp changes without forking whisper.cpp.
+    println!("cargo:rerun-if-env-changed=WHISPER_PATCHES");
+    let patches = whisper_patches();
+    let stamp = patches_stamp(&patches);
+    let stamp_path = out.join("whisper.cpp.patches");
+    if whisper_root.exists() && std::fs::read_to_string(&stamp_path).ok().as_deref() != Some(stamp.as_str()) {
+        std::fs::remove_dir_all(&whisper_root).expect("Failed to remove stale whisper sources");
+    }
+
     if !whisper_root.exists() {
         std::fs::create_dir_all(&whisper_root).unwrap();
         fs_extra::dir::copy("./whisper.cpp", &out, &Default::default()).unwrap_or_else(|e| {
@@ -128,6 +138,8 @@ fn main() {
                 e
             )
         });
+        apply_patches(&whisper_root, &patches);
+        std::fs::write(&stamp_path, &stamp).expect("Failed to write the patch stamp");
     }
 
     if env::var("WHISPER_DONT_GENERATE_BINDINGS").is_ok() {
@@ -145,6 +157,17 @@ fn main() {
             bindings = bindings
                 .header("whisper.cpp/ggml/include/ggml-vulkan.h")
                 .clang_arg("-DGGML_USE_VULKAN=1");
+        }
+
+        // bindgen's clang finds no system headers on macOS without the SDK, and the fallback
+        // below is generated for another whisper.cpp and platform.
+        if target.contains("apple") && env::var_os("SDKROOT").is_none() {
+            if let Ok(out) = std::process::Command::new("xcrun").args(["--show-sdk-path"]).output() {
+                let sdk = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if out.status.success() && !sdk.is_empty() {
+                    bindings = bindings.clang_arg(format!("-isysroot{}", sdk));
+                }
+            }
         }
 
         let bindings = bindings
@@ -360,10 +383,35 @@ fn main() {
         }
     }
 
-    // Allow passing any WHISPER or CMAKE compile flags
+    // A release is built on one machine and run on many: -march=native would bake in the build
+    // host's instruction set (CI hosts have AVX-512). x86-64-v3 instead: Haswell and Zen 1 onwards.
+    // Intel Macs keep x86-64's baseline: Catalina still runs on Ivy Bridge, which lacks AVX2, and
+    // they transcribe on Metal anyway.
+    if target.starts_with("x86_64") && env::var_os("GGML_NATIVE").is_none() {
+        config.define("GGML_NATIVE", "OFF");
+        if !target.contains("apple") {
+            for isa in ["GGML_SSE42", "GGML_AVX", "GGML_AVX2", "GGML_FMA", "GGML_F16C", "GGML_BMI2"] {
+                config.define(isa, "ON");
+            }
+        }
+    }
+
+    // KleidiAI's int8 matmul kernels pick dotprod, i8mm or SME at runtime, where the rest of
+    // ggml-cpu is fixed at the cross-compile's baseline (armv8.0 for Android).
+    let kleidiai = target.starts_with("aarch64") && (target.contains("android") || target.contains("linux"));
+    if kleidiai {
+        let src = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("kleidiai");
+        config.define("GGML_CPU_KLEIDIAI", "ON");
+        config.define("FETCHCONTENT_SOURCE_DIR_KLEIDIAI", &src);
+        config.define("FETCHCONTENT_FULLY_DISCONNECTED", "ON");
+    }
+
+    // Allow passing any WHISPER, GGML or CMAKE compile flags
     for (key, value) in env::vars() {
-        let is_whisper_flag =
-            key.starts_with("WHISPER_") && key != "WHISPER_DONT_GENERATE_BINDINGS";
+        let is_whisper_flag = key.starts_with("WHISPER_")
+            && key != "WHISPER_DONT_GENERATE_BINDINGS"
+            && key != "WHISPER_PATCHES"
+            || key.starts_with("GGML_");
         let is_cmake_flag = key.starts_with("CMAKE_");
         if is_whisper_flag || is_cmake_flag {
             config.define(&key, &value);
@@ -397,6 +445,10 @@ fn main() {
         println!("cargo:rustc-link-lib=static=ggml");
         println!("cargo:rustc-link-lib=static=ggml-base");
         println!("cargo:rustc-link-lib=static=ggml-cpu");
+    }
+    // after ggml-cpu, which calls into it
+    if kleidiai {
+        println!("cargo:rustc-link-lib=static=kleidiai");
     }
     if target.contains("apple") || cfg!(feature = "openblas") {
         println!("cargo:rustc-link-lib=static=ggml-blas");
@@ -463,15 +515,92 @@ fn add_link_search_path(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn whisper_patches() -> Vec<PathBuf> {
+    let Some(dir) = env::var_os("WHISPER_PATCHES") else {
+        println!("cargo:warning=WHISPER_PATCHES is unset: building whisper.cpp unpatched");
+        return Vec::new();
+    };
+    let dir = PathBuf::from(dir);
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let mut patches: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("WHISPER_PATCHES {}: {}", dir.display(), e))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "patch"))
+        .collect();
+    patches.sort();
+    for p in &patches {
+        println!("cargo:rerun-if-changed={}", p.display());
+    }
+    patches
+}
+
+// FNV-1a over whisper.cpp's version and each patch's name and bytes: the copied sources are
+// rebuilt when this changes.
+fn patches_stamp(patches: &[PathBuf]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let version = get_whisper_cpp_version(std::path::Path::new("./whisper.cpp")).ok().flatten().unwrap_or_default();
+    for b in version.bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    for p in patches {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned().into_bytes();
+        for b in name.into_iter().chain(std::fs::read(p).expect("Failed to read a patch")) {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{:016x}", h)
+}
+
+fn apply_patches(root: &std::path::Path, patches: &[PathBuf]) {
+    if patches.is_empty() {
+        return;
+    }
+    // A repository of its own: inside an enclosing one, `git apply` skips paths outside the
+    // current directory without an error. The copy's `.git` is the submodule's link, which no
+    // longer resolves from here.
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        std::fs::remove_dir_all(&dot_git).expect("Failed to remove the copied .git");
+    } else if dot_git.exists() {
+        std::fs::remove_file(&dot_git).expect("Failed to remove the copied .git");
+    }
+    let git = |args: &[&std::ffi::OsStr]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("Failed to run git (needed to apply WHISPER_PATCHES)");
+        status.success()
+    };
+    assert!(git(&["init".as_ref(), "-q".as_ref()]), "git init failed in {}", root.display());
+    for p in patches {
+        // --ignore-whitespace: a CRLF checkout of whisper.cpp still matches the LF patches
+        let ok = git(&["apply".as_ref(), "--whitespace=nowarn".as_ref(), "--ignore-whitespace".as_ref(), p.as_os_str()]);
+        assert!(ok, "Failed to apply {}", p.display());
+    }
+}
+
 fn get_whisper_cpp_version(whisper_root: &std::path::Path) -> std::io::Result<Option<String>> {
     let cmake_lists = BufReader::new(File::open(whisper_root.join("CMakeLists.txt"))?);
 
+    let (mut major, mut minor) = (None, None);
     for line in cmake_lists.lines() {
         let line = line?;
 
         if let Some(suffix) = line.strip_prefix(r#"project("whisper.cpp" VERSION "#) {
             let whisper_cpp_version = suffix.trim_end_matches(')');
             return Ok(Some(whisper_cpp_version.into()));
+        }
+        // 1.9 onwards sets the parts separately
+        let part = |name: &str| line.strip_prefix(name).map(|v| v.trim_end_matches(')').trim().to_string());
+        if let Some(v) = part("set(WHISPER_VERSION_MAJOR ") {
+            major = Some(v);
+        } else if let Some(v) = part("set(WHISPER_VERSION_MINOR ") {
+            minor = Some(v);
+        } else if let Some(v) = part("set(WHISPER_VERSION_PATCH ") {
+            if let (Some(major), Some(minor)) = (&major, &minor) {
+                return Ok(Some(format!("{}.{}.{}", major, minor, v)));
+            }
         }
     }
 
