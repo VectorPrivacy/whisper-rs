@@ -386,13 +386,13 @@ fn main() {
     // A release is built on one machine and run on many: -march=native would bake in the build
     // host's instruction set (CI hosts have AVX-512). x86-64-v3 instead: Haswell and Zen 1 onwards.
     // Intel Macs keep x86-64's baseline: Catalina still runs on Ivy Bridge, which lacks AVX2, and
-    // they transcribe on Metal anyway.
+    // they transcribe on Metal anyway. Set either way: a build that isn't cross-compiled turns
+    // every one of these on by default.
     if target.starts_with("x86_64") && env::var_os("GGML_NATIVE").is_none() {
         config.define("GGML_NATIVE", "OFF");
-        if !target.contains("apple") {
-            for isa in ["GGML_SSE42", "GGML_AVX", "GGML_AVX2", "GGML_FMA", "GGML_F16C", "GGML_BMI2"] {
-                config.define(isa, "ON");
-            }
+        let isas = if target.contains("apple") { "OFF" } else { "ON" };
+        for isa in ["GGML_SSE42", "GGML_AVX", "GGML_AVX2", "GGML_FMA", "GGML_F16C", "GGML_BMI2"] {
+            config.define(isa, isas);
         }
     }
 
